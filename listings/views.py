@@ -1,52 +1,35 @@
-import requests
-from django.http import JsonResponse
-from django.conf import settings
-from .models import Payment
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from .models import Booking, Listing
+from .serializers import BookingSerializer
+from .tasks import send_booking_confirmation_email
+from django.utils import timezone
 
-def initiate_payment(request):
-    # Example: Booking details received via POST
-    booking_reference = request.POST.get("booking_reference")
-    amount = request.POST.get("amount")
+class BookingViewSet(viewsets.ModelViewSet):
+    queryset = Booking.objects.all()
+    serializer_class = BookingSerializer
 
-    payload = {
-        "amount": amount,
-        "currency": "ETB",
-        "email": request.POST.get("email"),
-        "tx_ref": booking_reference,
-        "callback_url": "http://your-domain.com/payment/verify/"
-    }
-
-    headers = {"Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"}
-
-    response = requests.post(f"{settings.CHAPA_BASE_URL}/transaction/initialize", json=payload, headers=headers)
-    data = response.json()
-
-    if response.status_code == 200 and data.get("status") == "success":
-        Payment.objects.create(
-            booking_reference=booking_reference,
-            amount=amount,
-            transaction_id=data["data"]["id"],
-            status="Pending"
-        )
-        return JsonResponse({"payment_url": data["data"]["checkout_url"]})
-    return JsonResponse({"error": data.get("message")}, status=400)
-
-
-def verify_payment(request):
-    tx_ref = request.GET.get("tx_ref")
-    transaction_id = request.GET.get("transaction_id")
-
-    headers = {"Authorization": f"Bearer {settings.CHAPA_SECRET_KEY}"}
-    response = requests.get(f"{settings.CHAPA_BASE_URL}/transaction/verify/{transaction_id}", headers=headers)
-    data = response.json()
-
-    payment = Payment.objects.get(transaction_id=transaction_id)
-
-    if data.get("status") == "success":
-        payment.status = "Completed"
-    else:
-        payment.status = "Failed"
-    payment.save()
-
-    # Optionally trigger Celery email task here
-    return JsonResponse({"status": payment.status})
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Save the booking
+        booking = serializer.save()
+        
+        # Trigger email task asynchronously
+        try:
+            listing = booking.listing
+            send_booking_confirmation_email.delay(
+                booking_id=booking.id,
+                user_email=booking.user.email,
+                listing_title=listing.title,
+                check_in_date=booking.check_in_date.strftime('%Y-%m-%d'),
+                check_out_date=booking.check_out_date.strftime('%Y-%m-%d')
+            )
+        except Exception as e:
+            # Log the error but don't fail the booking creation
+            print(f"Failed to trigger email task: {e}")
+        
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
